@@ -8,7 +8,6 @@
 // The complexity in the code below comes from the fact that newly detected PIR
 // motion needs to be reported as soon as possible, but only once, while all the
 // other sensor values are being collected and averaged in a more regular cycle.
-
 #include <JeeLib.h>
 #include <PortsSHT11.h>
 #include <avr/sleep.h>
@@ -18,20 +17,24 @@
 #define DEBUG   1   // set to 1 to display each loop() run and PIR trigger
 
 #define SHT11_PORT  0   // defined if SHT11 is connected to a port  -- ORIG 1
-#define HYT131_PORT 1   // defined if HYT131 is connected to a port
-#define LDR_PORT    4   // defined if LDR is connected to a port's AIO pin
-#define PIR_PORT    4   // defined if PIR is connected to a port's DIO pin
+#define HYT131_PORT 4   // defined if HYT131 is connected to a port
+#define LDR_PORT    1   // defined if LDR is connected to a port's AIO pin
+#define PIR_PORT    1   // defined if PIR is connected to a port's DIO pin
 
 #define MEASURE_PERIOD  100 // how often to measure, in tenths of seconds  -- ORIG 600
 #define RETRY_PERIOD    10  // how soon to retry if ACK didn't come in
 #define RETRY_LIMIT     5   // maximum number of times to retry
 #define ACK_TIME        10  // number of milliseconds to wait for an ack
-#define REPORT_EVERY    1   // report every N measurement cycles  -- ORIG 5
+#define REPORT_EVERY    5   // report every N measurement cycles  -- ORIG 5
 #define SMOOTH          3   // smoothing factor used for running averages
 
 // set the sync mode to 2 if the fuses are still the Arduino default
 // mode 3 (full powerdown) can only be used with 258 CK startup fuses
 #define RADIO_SYNC_MODE 2
+
+typedef struct { int light, humi, moved, tempF; } PayloadTX;
+PayloadTX emontx;
+
 
 // The scheduler makes it easy to perform various tasks at various times:
 
@@ -46,15 +49,21 @@ static byte reportCount;    // count up until next report, i.e. packet send
 static byte myNodeID;       // node ID used for this unit
 
 // This defines the structure of the packets which get sent out by wireless:
-
+//TESTING
+/*
 struct {
     byte light;     // light sensor: 0..255
-    byte moved :1;  // motion detector: 0..1
     byte humi  :7;  // humidity: 0..100
-    int temp   :10; // temperature: -500..+500 (tenths)
-    byte lobat :1;  // supply voltage dropped under 3.1V: 0..1
+    byte moved  :1;  // motion detector: 0..1
+    int tempF   :10; // temperature: -500..+500 (tenths)
 } payload;
+*/
 
+
+
+//byte lobat :1;  // supply voltage dropped under 3.1V: 0..1
+
+int temp;
 // Conditional code, depending on which sensors are connected and how:
 
 #if SHT11_PORT
@@ -62,7 +71,7 @@ struct {
 #endif
 
 #if HYT131_PORT
-    PortI2C myBus (1);
+    PortI2C myBus (HYT131_PORT);
     DeviceI2C hyt131 (myBus, 0x28);
 #endif
 
@@ -152,9 +161,9 @@ static byte waitForAck() {
 
 // readout all the sensors and other values
 static void doMeasure() {
-    byte firstTime = payload.humi == 0; // special case to init running avg
+    byte firstTime = emontx.humi == 0; // special case to init running avg
     
-    payload.lobat = rf12_lowbat();
+//    payload.lobat = rf12_lowbat();
 
     #if SHT11_PORT
 #ifndef __AVR_ATtiny84__
@@ -167,8 +176,8 @@ static void doMeasure() {
         //XXX TINY!
         int humi = 50, temp = 25;
 #endif
-        payload.humi = smoothedAverage(payload.humi, humi, firstTime);
-        payload.temp = smoothedAverage(payload.temp, temp, firstTime);
+        emontx.humi = smoothedAverage(emontx.humi, humi, firstTime);
+        emontx.temp = smoothedAverage(emontx.temp, temp, firstTime);
     #endif
     
     #if HYT131_PORT
@@ -187,27 +196,31 @@ static void doMeasure() {
         
         // convert 0..16383 to 0..100.0 % RH
         int humi = (h * 1000L >> 14);
-        payload.humi = humi * 0.1;
+        emontx.humi = humi * 0.1;
         // convert 0..16383 to -40.0..125.0 deg.C
-        int temp = (t * 1650L >> 14) -400;
-        payload.temp = temp;
+        int temp = (t * 1600L >> 14) -400;
+        int tempF = (temp * 9 / 5) + 320;
+        emontx.tempF = tempF;
+        
         
         // report results
-        Serial.print(payload.temp * 0.1, 1);
-        Serial.print (" C, ");
-        Serial.print(payload.humi);
+        //Serial.print(emontx.tempF * 0.1, 1);
+        //Serial.print (" C, ");
+         Serial.print(tempF * 0.1, 1);
+        Serial.print (" F, ");
+        Serial.print(emontx.humi);
         Serial.println(" %");
     #endif     
     
     
     #if LDR_PORT
         ldr.digiWrite2(1);  // enable AIO pull-up
-        byte light = ~ ldr.anaRead() >> 2;
+        int light = ~ ldr.anaRead() >> 2;
         ldr.digiWrite2(0);  // disable pull-up to reduce current draw
-        payload.light = smoothedAverage(payload.light, light, firstTime);
+        emontx.light = smoothedAverage(emontx.light, light, firstTime);
     #endif
     #if PIR_PORT
-        payload.moved = pir.state();
+        emontx.moved = pir.state();
     #endif
     
 }
@@ -224,21 +237,21 @@ static void doReport() {
     rf12_sleep(RF12_WAKEUP);
     while (!rf12_canSend())
         rf12_recvDone();
-    rf12_sendStart(0, &payload, sizeof payload, RADIO_SYNC_MODE);
+    rf12_sendStart(0, &emontx, sizeof emontx, RADIO_SYNC_MODE);
     rf12_sleep(RF12_SLEEP);
 
     #if SERIAL
         Serial.print("ROOM ");
-        Serial.print((int) payload.light);
+        Serial.print((int) emontx.light);
         Serial.print(' ');
-        Serial.print((int) payload.moved);
+        Serial.print((int) emontx.moved);
         Serial.print(' ');
-        Serial.print((int) payload.humi);
+        Serial.print((int) emontx.humi);
         Serial.print(' ');
-        Serial.print((int) payload.temp);
+        Serial.print((int) emontx.tempF);
         Serial.print(' ');
-        Serial.print((int) payload.lobat);
-        Serial.println();
+//        Serial.print((int) payload.lobat);
+       Serial.print(' ');
         serialFlush();
     #endif
 }
@@ -247,7 +260,7 @@ static void doReport() {
 static void doTrigger() {
     #if DEBUG
         Serial.print("PIR ");
-        Serial.print((int) payload.moved);
+        Serial.print((int) emontx.moved);
         serialFlush();
     #endif
 
@@ -255,7 +268,7 @@ static void doTrigger() {
         rf12_sleep(RF12_WAKEUP);
         while (!rf12_canSend())
             rf12_recvDone();
-        rf12_sendStart(RF12_HDR_ACK, &payload, sizeof payload, RADIO_SYNC_MODE);
+        rf12_sendStart(RF12_HDR_ACK, &emontx, sizeof emontx, RADIO_SYNC_MODE);
         byte acked = waitForAck();
         rf12_sleep(RF12_SLEEP);
 
@@ -325,7 +338,7 @@ void loop () {
 
     #if PIR_PORT
         if (pir.triggered()) {
-            payload.moved = pir.state();
+            emontx.moved = pir.state();
             doTrigger();
         }
     #endif
